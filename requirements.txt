@@ -1,0 +1,34 @@
+# dual_grid_bot/requirements.txt
+
+# 核心依赖
+ccxt>=4.0.0
+pydantic>=2.0.0
+asyncio-mqtt>=0.13.0
+
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 网络和异步
+aiohttp>=3.8.0
+websockets>=11.0.0
+requests>=2.28.0
+
+# 日志和配置
+python-dotenv>=1.0.0
+
+# 数学计算
+decimal
+
+# 开发和测试工具
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+flake8>=6.0.0
+
+# 可选：如果需要更高级的日志功能
+# loguru>=0.7.0
+
+# 可选：如果需要数据库存储
+# sqlalchemy>=2.0.0
+# aiosqlite>=0.19.0
