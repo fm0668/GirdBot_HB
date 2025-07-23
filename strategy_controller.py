@@ -43,7 +43,13 @@ class StrategyController:
         # 监控任务
         self.monitor_task: Optional[asyncio.Task] = None
         self.executor_tasks: Dict[str, asyncio.Task] = {}
-        
+
+        # 边界监控配置
+        self.boundary_stop_enabled = ALL_CONFIG["grid"].get("boundary_stop_enabled", True)
+        self.boundary_check_interval = ALL_CONFIG["grid"].get("boundary_check_interval", 5)
+        self.last_boundary_check = 0
+        self.stop_signal = False
+
         self.logger.info("StrategyController initialized")
     
     async def initialize_connectors(self):
@@ -398,7 +404,7 @@ class StrategyController:
             last_sync_time = 0
             last_heartbeat_time = 0
 
-            while self.is_running:
+            while self.is_running and not self.stop_signal:
                 current_time = time.time()
 
                 # 定期同步状态
@@ -410,6 +416,17 @@ class StrategyController:
                 if current_time - last_heartbeat_time >= heartbeat_interval:
                     await self._heartbeat_check()
                     last_heartbeat_time = current_time
+
+                # 边界检查（定时执行）
+                if (self.boundary_stop_enabled and
+                    current_time - self.last_boundary_check >= self.boundary_check_interval):
+
+                    if await self._check_price_boundary():
+                        self.logger.critical("🚨 检测到价格触碰边界，启动紧急停止程序")
+                        await self._handle_boundary_breach()
+                        break
+
+                    self.last_boundary_check = current_time
 
                 # 检查执行器状态
                 await self._check_executor_health()
@@ -771,3 +788,203 @@ class StrategyController:
 
         except Exception as e:
             self.logger.error(f"Cleanup error: {e}")
+
+    async def _check_price_boundary(self) -> bool:
+        """检查价格是否触碰网格边界"""
+        try:
+            # 获取当前价格
+            current_price = self.connector_a.get_mid_price()
+            grid_config = ALL_CONFIG["grid"]
+
+            upper_boundary = grid_config["end_price"]
+            lower_boundary = grid_config["start_price"]
+
+            # 检查边界触碰
+            if current_price >= upper_boundary:
+                self.logger.critical(f"价格触碰上边界: {current_price:.5f} >= {upper_boundary:.5f}")
+                return True
+            elif current_price <= lower_boundary:
+                self.logger.critical(f"价格触碰下边界: {current_price:.5f} <= {lower_boundary:.5f}")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"边界检查失败: {e}")
+            return False
+
+    async def _handle_boundary_breach(self):
+        """处理边界突破事件"""
+        try:
+            self.logger.critical("=" * 80)
+            self.logger.critical("🚨 网格边界突破处理程序")
+            self.logger.critical("=" * 80)
+
+            # 1. 立即停止策略运行
+            self.is_running = False
+            self.stop_signal = True
+            self.stop_time = datetime.now()
+
+            # 2. 执行紧急清理
+            cleanup_success = await self._emergency_cleanup_all_accounts()
+
+            # 3. 记录处理结果
+            if cleanup_success:
+                self.logger.critical("✅ 边界突破处理完成，所有账户已清理")
+            else:
+                self.logger.critical("❌ 边界突破处理不完整，请人工检查账户状态")
+
+            self.logger.critical("🛑 网格策略已停止")
+
+        except Exception as e:
+            self.logger.critical(f"边界突破处理失败: {e}")
+            # 确保策略停止
+            self.is_running = False
+            self.stop_signal = True
+
+    async def _emergency_cleanup_all_accounts(self) -> bool:
+        """紧急清理所有账户"""
+        try:
+            self.logger.critical("开始紧急清理所有账户...")
+
+            # 并行清理两个账户
+            cleanup_tasks = [
+                self._emergency_cleanup_single_account("账户A", self.connector_a),
+                self._emergency_cleanup_single_account("账户B", self.connector_b)
+            ]
+
+            # 等待所有清理任务完成
+            cleanup_results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+            # 检查清理结果
+            account_a_success = not isinstance(cleanup_results[0], Exception) and cleanup_results[0]
+            account_b_success = not isinstance(cleanup_results[1], Exception) and cleanup_results[1]
+
+            # 记录异常信息
+            if isinstance(cleanup_results[0], Exception):
+                self.logger.error(f"账户A清理异常: {cleanup_results[0]}")
+            if isinstance(cleanup_results[1], Exception):
+                self.logger.error(f"账户B清理异常: {cleanup_results[1]}")
+
+            # 验证清理结果
+            if account_a_success and account_b_success:
+                verification_success = await self._verify_all_accounts_clean()
+                if verification_success:
+                    self.logger.critical("✅ 双账户紧急清理验证通过")
+                    return True
+                else:
+                    self.logger.critical("❌ 双账户清理验证失败")
+                    return False
+            else:
+                self.logger.critical("❌ 部分账户清理失败")
+                return False
+
+        except Exception as e:
+            self.logger.critical(f"紧急清理所有账户失败: {e}")
+            return False
+
+    async def _emergency_cleanup_single_account(self, account_name: str, connector: BinanceConnector) -> bool:
+        """紧急清理单个账户"""
+        try:
+            self.logger.info(f"🧹 清理{account_name}...")
+
+            # 1. 取消所有挂单（重试机制）
+            cancel_success = False
+            for attempt in range(3):
+                try:
+                    cancel_success = connector.cancel_all_orders()
+                    if cancel_success:
+                        self.logger.info(f"{account_name} 挂单取消成功")
+                        break
+                    else:
+                        self.logger.warning(f"{account_name} 挂单取消失败，重试 {attempt + 1}/3")
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    self.logger.error(f"{account_name} 取消挂单异常: {e}")
+                    await asyncio.sleep(1)
+
+            # 等待取消生效
+            await asyncio.sleep(2)
+
+            # 2. 市价平掉所有持仓（重试机制）
+            close_success = False
+            for attempt in range(3):
+                try:
+                    close_success = connector.close_all_positions()
+                    if close_success:
+                        self.logger.info(f"{account_name} 持仓平仓成功")
+                        break
+                    else:
+                        self.logger.warning(f"{account_name} 持仓平仓失败，重试 {attempt + 1}/3")
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    self.logger.error(f"{account_name} 平仓异常: {e}")
+                    await asyncio.sleep(1)
+
+            # 等待平仓生效
+            await asyncio.sleep(3)
+
+            # 3. 验证清理结果
+            verification_success = await self._verify_single_account_clean(account_name, connector)
+
+            overall_success = cancel_success and close_success and verification_success
+
+            if overall_success:
+                self.logger.critical(f"✅ {account_name} 紧急清理成功")
+            else:
+                self.logger.critical(f"❌ {account_name} 紧急清理失败")
+                self.logger.critical(f"  取消挂单: {'✅' if cancel_success else '❌'}")
+                self.logger.critical(f"  平掉持仓: {'✅' if close_success else '❌'}")
+                self.logger.critical(f"  验证清理: {'✅' if verification_success else '❌'}")
+
+            return overall_success
+
+        except Exception as e:
+            self.logger.critical(f"{account_name} 紧急清理异常: {e}")
+            return False
+
+    async def _verify_single_account_clean(self, account_name: str, connector: BinanceConnector) -> bool:
+        """验证单个账户清理结果"""
+        try:
+            # 检查挂单
+            orders = connector.get_open_orders()
+            orders_clean = len(orders) == 0
+
+            # 检查持仓
+            long_pos, short_pos = connector.get_positions()
+            positions_clean = abs(long_pos) < 0.001 and abs(short_pos) < 0.001  # 允许微小误差
+
+            if orders_clean and positions_clean:
+                self.logger.info(f"{account_name} 清理验证通过")
+                return True
+            else:
+                self.logger.warning(f"{account_name} 清理验证失败:")
+                if not orders_clean:
+                    self.logger.warning(f"  剩余挂单数量: {len(orders)}")
+                if not positions_clean:
+                    self.logger.warning(f"  剩余持仓: 多头={long_pos:.6f}, 空头={short_pos:.6f}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"验证{account_name}清理结果失败: {e}")
+            return False
+
+    async def _verify_all_accounts_clean(self) -> bool:
+        """验证所有账户清理结果"""
+        try:
+            # 并行验证两个账户
+            verify_tasks = [
+                self._verify_single_account_clean("账户A", self.connector_a),
+                self._verify_single_account_clean("账户B", self.connector_b)
+            ]
+
+            verify_results = await asyncio.gather(*verify_tasks, return_exceptions=True)
+
+            account_a_clean = not isinstance(verify_results[0], Exception) and verify_results[0]
+            account_b_clean = not isinstance(verify_results[1], Exception) and verify_results[1]
+
+            return account_a_clean and account_b_clean
+
+        except Exception as e:
+            self.logger.error(f"验证所有账户清理结果失败: {e}")
+            return False

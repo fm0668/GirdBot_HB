@@ -66,22 +66,34 @@ stop_strategy_process() {
             print_info "正在停止策略进程 (PID: $PID)..."
             
             # 首先尝试优雅停止 (SIGTERM)
+            print_info "发送停止信号 (SIGTERM)..."
             kill -TERM "$PID" 2>/dev/null
-            
-            # 等待进程停止
+
+            # 等待进程优雅停止 (给策略足够时间清理)
             local count=0
-            while ps -p "$PID" > /dev/null 2>&1 && [ $count -lt 10 ]; do
+            local max_wait=30  # 增加到30秒，给策略足够时间清理
+            print_info "等待策略完成清理工作 (最多${max_wait}秒)..."
+
+            while ps -p "$PID" > /dev/null 2>&1 && [ $count -lt $max_wait ]; do
                 sleep 1
                 count=$((count + 1))
-                echo -n "."
+                # 每5秒显示一次进度
+                if [ $((count % 5)) -eq 0 ]; then
+                    print_info "等待中... (${count}/${max_wait}秒)"
+                else
+                    echo -n "."
+                fi
             done
             echo ""
-            
-            # 如果进程仍在运行，强制停止 (SIGKILL)
-            if ps -p "$PID" > /dev/null 2>&1; then
-                print_warning "优雅停止失败，强制停止进程..."
+
+            # 检查是否优雅停止成功
+            if ! ps -p "$PID" > /dev/null 2>&1; then
+                print_success "策略已优雅停止"
+            else
+                # 如果进程仍在运行，强制停止 (SIGKILL)
+                print_warning "策略未在预期时间内停止，强制终止进程..."
                 kill -KILL "$PID" 2>/dev/null
-                sleep 2
+                sleep 3
             fi
             
             # 检查进程是否已停止
