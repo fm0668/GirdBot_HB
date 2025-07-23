@@ -497,12 +497,27 @@ class StrategyController:
                 long_status = self.executor_long.get_status_info()
                 short_status = self.executor_short.get_status_info()
 
+                # 获取连接状态
+                conn_a_status = self.connector_a.is_connected() if self.connector_a else False
+                conn_b_status = self.connector_b.is_connected() if self.connector_b else False
+
+                # 获取详细连接信息
+                conn_a_details = self.connector_a.get_connection_status() if self.connector_a else {}
+                conn_b_details = self.connector_b.get_connection_status() if self.connector_b else {}
+
                 self.logger.info(
                     f"Strategy Status - "
                     f"Long: {long_status['status']} (Position: {long_status['position_size_base']:.2f}), "
                     f"Short: {short_status['status']} (Position: {short_status['position_size_base']:.2f}), "
-                    f"Grid Levels: {long_status['grid_levels']}"
+                    f"Grid Levels: {long_status['grid_levels']}, "
+                    f"Connections: A={conn_a_status}, B={conn_b_status}"
                 )
+
+                # 如果连接不健康，记录详细信息
+                if not conn_a_status:
+                    self.logger.warning(f"Account A WebSocket连接异常: {conn_a_details}")
+                if not conn_b_status:
+                    self.logger.warning(f"Account B WebSocket连接异常: {conn_b_details}")
 
         except Exception as e:
             self.logger.error(f"Status logging error: {e}")

@@ -91,6 +91,14 @@ class BinanceConnector:
         self.websocket_running = False
         self.lock = asyncio.Lock()
 
+        # 重连配置
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 10
+        self.reconnect_delay = 5  # 初始重连延迟（秒）
+        self.max_reconnect_delay = 60  # 最大重连延迟（秒）
+        self.connection_healthy = True
+        self.last_heartbeat_time = 0
+
         # 跳过双向持仓模式设置（用户已在账户后台设置）
         # self._check_and_enable_hedge_mode()
 
@@ -171,8 +179,8 @@ class BinanceConnector:
     
     def get_mid_price(self) -> Decimal:
         """获取中间价格"""
-        # 如果WebSocket正在运行且有最新价格，直接返回（快速路径）
-        if self.websocket_running and self.latest_price > 0:
+        # 如果WebSocket连接健康且有最新价格，直接返回（快速路径）
+        if self.is_connected() and self.latest_price > 0:
             return Decimal(str(self.latest_price))
 
         # 否则通过REST API获取（慢速路径）
@@ -379,15 +387,64 @@ class BinanceConnector:
 
         self.logger.info("WebSocket连接已停止")
 
+    def is_connected(self) -> bool:
+        """检查WebSocket连接健康状态"""
+        if not self.websocket_running:
+            return False
+
+        # 检查连接健康标志
+        if not self.connection_healthy:
+            return False
+
+        # 检查心跳时间（如果超过90秒无心跳，认为连接不健康）
+        current_time = time.time()
+        if self.last_heartbeat_time > 0 and current_time - self.last_heartbeat_time > 90:
+            self.logger.warning("WebSocket连接心跳超时，连接可能不健康")
+            return False
+
+        return True
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        """获取连接状态详情"""
+        current_time = time.time()
+        return {
+            "websocket_running": self.websocket_running,
+            "connection_healthy": self.connection_healthy,
+            "reconnect_attempts": self.reconnect_attempts,
+            "max_reconnect_attempts": self.max_reconnect_attempts,
+            "last_heartbeat_time": self.last_heartbeat_time,
+            "seconds_since_heartbeat": current_time - self.last_heartbeat_time if self.last_heartbeat_time > 0 else -1,
+            "is_connected": self.is_connected()
+        }
+
     async def _websocket_loop(self):
-        """WebSocket连接循环"""
+        """增强的WebSocket连接循环，支持指数退避重连"""
         while self.websocket_running:
             try:
                 await self._connect_websocket()
+                # 连接成功，重置重连计数
+                self.reconnect_attempts = 0
+                self.connection_healthy = True
+                self.logger.info("WebSocket连接已建立")
+
             except Exception as e:
+                self.connection_healthy = False
                 self.logger.error(f"WebSocket连接失败: {e}")
+
                 if self.websocket_running:
-                    await asyncio.sleep(5)  # 等待5秒后重试
+                    # 检查是否达到最大重连次数
+                    if self.reconnect_attempts >= self.max_reconnect_attempts:
+                        self.logger.error(f"达到最大重连次数({self.max_reconnect_attempts})，停止重连")
+                        self.websocket_running = False
+                        break
+
+                    # 指数退避重连
+                    delay = min(self.reconnect_delay * (2 ** self.reconnect_attempts),
+                              self.max_reconnect_delay)
+                    self.reconnect_attempts += 1
+
+                    self.logger.info(f"将在{delay}秒后重连 (尝试 {self.reconnect_attempts}/{self.max_reconnect_attempts})")
+                    await asyncio.sleep(delay)
 
     async def _connect_websocket(self):
         """连接WebSocket并订阅数据"""
@@ -395,24 +452,55 @@ class BinanceConnector:
             self.logger.error("listenKey为空，无法连接WebSocket")
             return
 
-        async with websockets.connect(WEBSOCKET_URL) as websocket:
-            # 订阅ticker数据
-            await self._subscribe_ticker(websocket)
+        try:
+            async with websockets.connect(
+                WEBSOCKET_URL,
+                ping_interval=20,  # 每20秒发送ping
+                ping_timeout=10,   # ping超时时间
+                close_timeout=10   # 关闭超时时间
+            ) as websocket:
+                self.logger.info("WebSocket连接已建立，开始订阅数据...")
 
-            # 订阅订单数据
-            await self._subscribe_orders(websocket)
+                # 订阅ticker数据
+                await self._subscribe_ticker(websocket)
 
-            # 处理消息
-            while self.websocket_running:
-                try:
-                    message = await asyncio.wait_for(websocket.recv(), timeout=30)
-                    await self._handle_websocket_message(message)
-                except asyncio.TimeoutError:
-                    # 发送ping保持连接
-                    await websocket.ping()
-                except Exception as e:
-                    self.logger.error(f"WebSocket消息处理失败: {e}")
-                    break
+                # 订阅订单数据
+                await self._subscribe_orders(websocket)
+
+                # 更新心跳时间
+                self.last_heartbeat_time = time.time()
+
+                # 处理消息
+                while self.websocket_running:
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                        await self._handle_websocket_message(message)
+
+                        # 更新心跳时间
+                        self.last_heartbeat_time = time.time()
+
+                    except asyncio.TimeoutError:
+                        # 检查连接健康状态
+                        current_time = time.time()
+                        if current_time - self.last_heartbeat_time > 60:  # 60秒无消息认为连接异常
+                            self.logger.warning("WebSocket连接超时，准备重连")
+                            raise ConnectionError("WebSocket连接超时")
+
+                        # 发送ping保持连接
+                        try:
+                            await websocket.ping()
+                            self.logger.debug("发送WebSocket ping")
+                        except Exception as ping_error:
+                            self.logger.error(f"发送ping失败: {ping_error}")
+                            raise
+
+                    except Exception as e:
+                        self.logger.error(f"WebSocket消息处理失败: {e}")
+                        raise
+
+        except Exception as e:
+            self.logger.error(f"WebSocket连接异常: {e}")
+            raise
 
     async def _subscribe_ticker(self, websocket):
         """订阅ticker数据"""
