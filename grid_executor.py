@@ -77,6 +77,9 @@ class GridExecutor:
 
         # 时间戳
         self.max_open_creation_timestamp = 0
+
+        # 事件驱动相关
+        self.last_fallback_sync = 0  # 上次备用轮询时间
         
         self.logger.info(f"网格执行器已初始化: {config.side.value} 方向, {len(self.grid_levels)} 个层级")
     
@@ -210,15 +213,106 @@ class GridExecutor:
         step = (end - start) / (n - 1)
         return [start + i * step for i in range(n)]
 
+    # ==================== 事件驱动相关方法 ====================
+
+    def process_event(self, event_data: Dict[str, Any]):
+        """处理单个订单事件的核心入口"""
+        try:
+            client_order_id = event_data.get('c')
+            if not client_order_id:
+                return
+
+            # 查找对应的网格层级和订单
+            target_level, tracked_order = None, None
+            for level in self.grid_levels:
+                if (level.active_open_order and
+                    level.active_open_order.client_order_id == client_order_id):
+                    target_level, tracked_order = level, level.active_open_order
+                    break
+                if (level.active_close_order and
+                    level.active_close_order.client_order_id == client_order_id):
+                    target_level, tracked_order = level, level.active_close_order
+                    break
+
+            if not target_level or not tracked_order:
+                return  # 事件与此执行器无关
+
+            # 使用新方法更新订单状态
+            if tracked_order.update_from_exchange_data(event_data):
+                status = event_data.get('X', 'unknown')
+                self.logger.info(f"事件处理: 订单 {client_order_id} 状态更新为 {status}")
+
+                # 状态更新后，层级的状态机也会随之改变
+                target_level.update_state()
+
+                # 如果订单完成，记录相关信息
+                if tracked_order.is_filled:
+                    self._handle_order_filled(target_level, tracked_order, event_data)
+            else:
+                self.logger.warning(f"事件处理失败: 订单 {client_order_id}")
+
+        except Exception as e:
+            self.logger.error(f"处理订单事件失败: {e}")
+
+    def _handle_order_filled(self, level: GridLevel, order: TrackedOrder, event_data: Dict[str, Any]):
+        """处理订单成交事件"""
+        try:
+            filled_qty = event_data.get('z', '0')  # 累计成交数量
+            filled_price = event_data.get('ap', '0')  # 平均成交价格
+
+            if order == level.active_open_order:
+                # 开仓订单成交
+                self.logger.info(f"订单 {order.order_id} 已成交: 数量={filled_qty}, 金额={float(filled_qty) * float(filled_price):.5f}")
+            elif order == level.active_close_order:
+                # 平仓订单成交
+                self.logger.info(f"网格层级 {level.id} 交易完成: "
+                               f"开仓成本={level.active_open_order.executed_amount_quote:.4f}, "
+                               f"平仓收入={order.executed_amount_quote:.4f}, "
+                               f"手续费={order.cum_fees_quote:.4f}, "
+                               f"净收益={order.executed_amount_quote - level.active_open_order.executed_amount_quote - order.cum_fees_quote:.4f}")
+
+        except Exception as e:
+            self.logger.error(f"处理订单成交事件失败: {e}")
+
+    async def sync_orders_status_fallback(self):
+        """备用轮询，用于同步可能丢失的事件"""
+        try:
+            # 收集所有未完成的订单
+            pending_orders = []
+            for level in self.grid_levels:
+                if level.active_open_order and not level.active_open_order.is_done:
+                    pending_orders.append((level, level.active_open_order))
+                if level.active_close_order and not level.active_close_order.is_done:
+                    pending_orders.append((level, level.active_close_order))
+
+            if not pending_orders:
+                return
+
+            self.logger.debug(f"备用轮询: 检查 {len(pending_orders)} 个未完成订单")
+
+            # 批量查询订单状态
+            for level, order in pending_orders:
+                if order.order_id:
+                    order_status = self.connector.get_order_status(order.order_id)
+                    if order_status:
+                        order.update_from_exchange_data(order_status)
+                        level.update_state()
+
+        except Exception as e:
+            self.logger.error(f"备用轮询失败: {e}")
+
     async def control_task(self):
         """
-        主控制循环 - 完整版本，包含订单状态监控和生命周期管理
+        主控制循环 - 事件驱动版本，轮询为备用
         """
         try:
-            # 1. 批量更新所有订单状态
-            self.update_all_order_status()
+            # 1. 【可选，低频】执行备用轮询
+            current_time = time.time()
+            if current_time - self.last_fallback_sync > 30:  # 每30秒执行一次备用轮询
+                await self.sync_orders_status_fallback()
+                self.last_fallback_sync = current_time
 
-            # 2. 更新网格层级状态
+            # 2. 更新网格层级状态（基于可能已被事件更新的状态）
             self.update_grid_levels()
 
             # 3. 更新基础指标
@@ -571,6 +665,7 @@ class GridExecutor:
                 # 创建追踪订单
                 tracked_order = TrackedOrder(
                     order_id=order_result['id'],
+                    client_order_id=order_result.get('clientOrderId'),  # 设置client_order_id用于事件匹配
                     order_type=level.order_type,
                     price=level.price,
                     amount=base_amount,
@@ -672,6 +767,7 @@ class GridExecutor:
                 # 创建追踪订单
                 tracked_order = TrackedOrder(
                     order_id=order_result['id'],
+                    client_order_id=order_result.get('clientOrderId'),  # 设置client_order_id用于事件匹配
                     order_type=OrderType.LIMIT,
                     price=close_price,
                     amount=close_amount,

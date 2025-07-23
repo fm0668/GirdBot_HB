@@ -98,8 +98,10 @@ class TrackedOrder(BaseModel):
     """
     一个简化的订单追踪模型，用于GridLevel。
     它存储了在途或已完成订单的关键信息。
+    支持事件驱动的实时状态更新。
     """
     order_id: Optional[str] = None
+    client_order_id: Optional[str] = None  # 新增：用于事件匹配
     order_type: Optional[OrderType] = None
     
     # 订单的核心参数
@@ -127,23 +129,37 @@ class TrackedOrder(BaseModel):
             return self.raw_info['status']
         return "unknown"
 
-    def update_from_exchange_data(self, order_data: Dict[str, Any]):
-        """从交易所数据更新订单状态"""
+    def update_from_exchange_data(self, order_data: Dict[str, Any]) -> bool:
+        """从交易所数据更新订单状态，支持REST API和WebSocket事件"""
         try:
-            # 更新成交状态
-            status = order_data.get('status', 'unknown')
-            self.is_filled = (status == 'closed' or status == 'filled')
-            self.is_done = (status in ['closed', 'filled', 'canceled'])
+            # 处理不同格式的订单数据
+            # WebSocket事件格式 vs REST API格式
+            if 'X' in order_data:  # WebSocket ORDER_TRADE_UPDATE格式
+                status = order_data.get('X', 'UNKNOWN').upper()
+                filled_qty = order_data.get('z', '0')  # 累计成交数量
+                filled_quote = order_data.get('Z', '0')  # 累计成交金额
+                client_order_id = order_data.get('c', '')
+            else:  # REST API格式
+                status = order_data.get('status', 'unknown').upper()
+                filled_qty = order_data.get('filled', '0')
+                filled_quote = order_data.get('cost', '0')
+                client_order_id = order_data.get('clientOrderId', '')
 
-            # 更新成交数量
-            if 'filled' in order_data:
-                self.executed_amount_base = Decimal(str(order_data['filled']))
+            # 更新状态
+            self.is_filled = status in ['CLOSED', 'FILLED']
+            self.is_done = status in ['CLOSED', 'FILLED', 'CANCELED', 'EXPIRED']
 
-            # 更新成交金额
-            if 'cost' in order_data:
-                self.executed_amount_quote = Decimal(str(order_data['cost']))
+            # 更新client_order_id（如果还没有的话）
+            if client_order_id and not self.client_order_id:
+                self.client_order_id = client_order_id
 
-            # 更新手续费
+            # 更新成交数量和金额
+            if filled_qty:
+                self.executed_amount_base = Decimal(str(filled_qty))
+            if filled_quote:
+                self.executed_amount_quote = Decimal(str(filled_quote))
+
+            # 更新手续费（WebSocket和REST格式不同）
             if 'fee' in order_data and order_data['fee']:
                 fee_info = order_data['fee']
                 if 'cost' in fee_info:
@@ -151,7 +167,6 @@ class TrackedOrder(BaseModel):
 
             # 更新原始信息
             self.raw_info = order_data
-
             return True
 
         except Exception as e:

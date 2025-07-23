@@ -40,9 +40,13 @@ class StrategyController:
         self.executor_long: Optional[GridExecutor] = None
         self.executor_short: Optional[GridExecutor] = None
         
+        # 事件队列（用于事件驱动模式）
+        self._event_queue = asyncio.Queue()
+
         # 监控任务
         self.monitor_task: Optional[asyncio.Task] = None
         self.executor_tasks: Dict[str, asyncio.Task] = {}
+        self.event_handler_task: Optional[asyncio.Task] = None
 
         # 边界监控配置
         self.boundary_stop_enabled = ALL_CONFIG["grid"].get("boundary_stop_enabled", True)
@@ -63,6 +67,9 @@ class StrategyController:
             trading_config = ALL_CONFIG["trading"]
             exchange_config = ALL_CONFIG["exchange"]
             
+            # 根据配置决定是否传递事件队列
+            event_queue = self._event_queue if ALL_CONFIG["grid"].get("event_driven_enabled", False) else None
+
             # 初始化账户A连接器（多头）
             self.connector_a = BinanceConnector(
                 api_key=account_a_config["api_key"],
@@ -71,9 +78,10 @@ class StrategyController:
                 contract_type=trading_config["contract_type"],
                 leverage=trading_config["leverage"],
                 sandbox=exchange_config["sandbox"],
-                account_name=account_a_config["name"]
+                account_name=account_a_config["name"],
+                event_queue=event_queue
             )
-            
+
             # 初始化账户B连接器（空头）
             self.connector_b = BinanceConnector(
                 api_key=account_b_config["api_key"],
@@ -82,7 +90,8 @@ class StrategyController:
                 contract_type=trading_config["contract_type"],
                 leverage=trading_config["leverage"],
                 sandbox=exchange_config["sandbox"],
-                account_name=account_b_config["name"]
+                account_name=account_b_config["name"],
+                event_queue=event_queue
             )
             
             # 验证连接
@@ -277,7 +286,13 @@ class StrategyController:
             # 6. 启动执行器
             await self.start_executors()
 
-            # 7. 启动监控
+            # 7. 启动事件监听（如果启用）
+            if ALL_CONFIG["grid"].get("event_driven_enabled", False):
+                await self.start_event_listening()
+            else:
+                self.logger.info("事件驱动模式已禁用，使用轮询模式")
+
+            # 8. 启动监控
             await self.start_monitoring()
 
             self.is_running = True
@@ -379,6 +394,49 @@ class StrategyController:
             self.logger.error(f"Executor loop error for {executor.config.id}: {e}")
             # 如果一个执行器出错，停止整个策略
             await self.stop()
+
+    async def start_event_listening(self):
+        """启动事件监听"""
+        try:
+            self.logger.info("Starting event listening...")
+
+            # 启动连接器的事件监听
+            await self.connector_a.start_event_listening()
+            await self.connector_b.start_event_listening()
+
+            # 启动事件处理任务
+            self.event_handler_task = asyncio.create_task(self._event_handler_loop())
+
+            self.logger.info("Event listening started successfully")
+
+        except Exception as e:
+            self.logger.error(f"Failed to start event listening: {e}")
+            raise
+
+    async def _event_handler_loop(self):
+        """事件处理循环"""
+        try:
+            while self.is_running:
+                try:
+                    # 等待事件，设置超时避免阻塞
+                    event = await asyncio.wait_for(self._event_queue.get(), timeout=1.0)
+
+                    # 根据账户名分发事件
+                    if event["account_name"] == self.connector_a.account_name:
+                        self.executor_long.process_event(event["data"])
+                    elif event["account_name"] == self.connector_b.account_name:
+                        self.executor_short.process_event(event["data"])
+                    else:
+                        self.logger.warning(f"收到未知账户的事件: {event['account_name']}")
+
+                except asyncio.TimeoutError:
+                    # 超时是正常的，继续循环
+                    continue
+                except Exception as e:
+                    self.logger.error(f"处理事件失败: {e}")
+
+        except Exception as e:
+            self.logger.error(f"事件处理循环异常: {e}")
 
     async def start_monitoring(self):
         """启动监控任务"""
@@ -546,7 +604,15 @@ class StrategyController:
             self.is_running = False
             self.stop_time = datetime.now()
 
-            # 1. 停止监控任务
+            # 1. 停止事件监听任务
+            if self.event_handler_task and not self.event_handler_task.done():
+                self.event_handler_task.cancel()
+                try:
+                    await self.event_handler_task
+                except asyncio.CancelledError:
+                    pass
+
+            # 2. 停止监控任务
             if self.monitor_task and not self.monitor_task.done():
                 self.monitor_task.cancel()
                 try:
@@ -554,7 +620,7 @@ class StrategyController:
                 except asyncio.CancelledError:
                     pass
 
-            # 2. 停止执行器任务
+            # 3. 停止执行器任务
             for name, task in self.executor_tasks.items():
                 if not task.done():
                     task.cancel()
@@ -563,10 +629,16 @@ class StrategyController:
                     except asyncio.CancelledError:
                         pass
 
-            # 3. 停止执行器
+            # 3. 停止连接器事件监听
+            if self.connector_a:
+                await self.connector_a.stop_event_listening()
+            if self.connector_b:
+                await self.connector_b.stop_event_listening()
+
+            # 4. 停止执行器
             await self.stop_executors()
 
-            # 4. 最终清理账户
+            # 5. 最终清理账户
             await self.final_cleanup()
 
             # 5. 验证清理结果

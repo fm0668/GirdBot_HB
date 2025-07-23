@@ -58,6 +58,10 @@ GRID_CONFIG = {
     # 边界处理配置
     "boundary_stop_enabled": True,        # 是否启用边界停止功能
     "boundary_check_interval": 5,         # 边界检查间隔（秒）
+
+    # 事件驱动模式配置
+    "event_driven_enabled": False,        # 暂时禁用事件驱动模式（开发中）
+    "fallback_sync_interval": 30,         # 备用轮询间隔（秒）
 }
 
 # ==============================================================================

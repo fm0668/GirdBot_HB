@@ -34,9 +34,10 @@ class BinanceConnector:
     从grid_binance.py提取和重构的交易所交互代码
     """
     
-    def __init__(self, api_key: str, api_secret: str, trading_pair: str, 
-                 contract_type: str = "USDC", leverage: int = 20, 
-                 sandbox: bool = False, account_name: str = ""):
+    def __init__(self, api_key: str, api_secret: str, trading_pair: str,
+                 contract_type: str = "USDC", leverage: int = 20,
+                 sandbox: bool = False, account_name: str = "",
+                 event_queue: Optional['asyncio.Queue'] = None):
         """
         初始化币安连接器
         
@@ -85,8 +86,14 @@ class BinanceConnector:
         self.last_orders_update_time = 0
         self.last_ticker_update_time = 0
 
+        # 事件队列（用于事件驱动模式）
+        self.event_queue = event_queue
+
         # WebSocket相关
         self.listenKey = None
+        self.user_data_stream_task: Optional['asyncio.Task'] = None
+        self._listen_key: Optional[str] = None
+        self._listen_key_last_update = 0
         self.websocket_task = None
         self.websocket_running = False
         self.lock = asyncio.Lock()
@@ -102,8 +109,7 @@ class BinanceConnector:
         # 跳过双向持仓模式设置（用户已在账户后台设置）
         # self._check_and_enable_hedge_mode()
 
-        # 获取listenKey
-        self._get_listen_key()
+        # listenKey将在start_event_listening时获取
         
     def _initialize_exchange(self, sandbox: bool = False) -> CustomBinance:
         """初始化交易所API连接 - 参考grid_binance.py的简化方法"""
@@ -673,7 +679,11 @@ class BinanceConnector:
                     self.trading_pair, 'limit', side, float(amount), float(price), params
                 )
 
-            self.logger.info(f"订单已下达: {order['id']} {side} {amount} @ {price}")
+            # 确保返回的订单信息包含client_order_id
+            if 'clientOrderId' not in order:
+                order['clientOrderId'] = client_order_id
+
+            self.logger.info(f"订单已下达: {order['id']} {side} {amount} @ {price} (clientOrderId: {client_order_id})")
             return order
 
         except Exception as e:
@@ -855,3 +865,181 @@ class BinanceConnector:
         except Exception as e:
             self.logger.error(f"获取账户信息失败: {e}")
             return {}
+
+    # ==================== 事件驱动相关方法 ====================
+
+    async def start_event_listening(self):
+        """启动事件监听（如果配置了事件队列）"""
+        if self.event_queue is not None:
+            self.user_data_stream_task = asyncio.create_task(self._user_data_stream_loop())
+            self.logger.info("用户数据流事件监听已启动")
+
+    async def stop_event_listening(self):
+        """停止事件监听"""
+        if self.user_data_stream_task:
+            self.user_data_stream_task.cancel()
+            try:
+                await self.user_data_stream_task
+            except asyncio.CancelledError:
+                pass
+            self.logger.info("用户数据流事件监听已停止")
+
+    async def _get_listen_key(self) -> Optional[str]:
+        """获取用户数据流的listen key"""
+        try:
+            # 使用ccxt的私有API获取listen key
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.exchange.fapiPrivatePostListenKey()
+            )
+            listen_key = response.get('listenKey')
+            if listen_key:
+                self._listen_key = listen_key
+                self._listen_key_last_update = time.time()
+                self.logger.debug(f"获取到listen key: {listen_key[:10]}...")
+                return listen_key
+        except Exception as e:
+            self.logger.error(f"获取listen key失败: {e}")
+        return None
+
+    async def _keep_listen_key_alive(self):
+        """保持listen key活跃"""
+        try:
+            if self._listen_key:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.exchange.fapiPrivatePutListenKey({'listenKey': self._listen_key})
+                )
+                self._listen_key_last_update = time.time()
+                self.logger.debug("Listen key已续期")
+        except Exception as e:
+            self.logger.error(f"续期listen key失败: {e}")
+
+    async def _user_data_stream_loop(self):
+        """用户数据流监听循环"""
+        retry_count = 0
+        max_retries = 10
+
+        while retry_count < max_retries:
+            try:
+                # 获取listen key
+                listen_key = await self._get_listen_key()
+                if not listen_key:
+                    await asyncio.sleep(5)
+                    retry_count += 1
+                    continue
+
+                # 构建WebSocket URL
+                ws_url = f"wss://fstream.binance.com/ws/{listen_key}"
+
+                # 连接WebSocket
+                async with websockets.connect(ws_url) as websocket:
+                    self.logger.info("用户数据流WebSocket连接已建立")
+                    retry_count = 0  # 重置重试计数
+
+                    # 启动心跳任务
+                    heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+                    try:
+                        while True:
+                            # 接收消息
+                            message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                            data = json.loads(message)
+
+                            # 处理消息
+                            await self._handle_user_data_message(data)
+
+                    except asyncio.TimeoutError:
+                        self.logger.warning("用户数据流接收超时，准备重连")
+                        break
+                    except websockets.exceptions.ConnectionClosed:
+                        self.logger.warning("用户数据流连接关闭，准备重连")
+                        break
+                    finally:
+                        heartbeat_task.cancel()
+
+            except Exception as e:
+                self.logger.error(f"用户数据流连接异常: {e}")
+                retry_count += 1
+                await asyncio.sleep(min(retry_count * 2, 30))  # 指数退避
+
+        self.logger.error("用户数据流连接达到最大重试次数，停止监听")
+
+    async def _heartbeat_loop(self):
+        """心跳循环，定期续期listen key"""
+        try:
+            while True:
+                await asyncio.sleep(1800)  # 每30分钟续期一次
+                await self._keep_listen_key_alive()
+        except asyncio.CancelledError:
+            pass
+
+    async def _handle_user_data_message(self, data: Dict[str, Any]):
+        """处理用户数据流消息"""
+        try:
+            event_type = data.get('e')
+
+            if event_type == 'ORDER_TRADE_UPDATE':
+                # 订单更新事件
+                order_data = data.get('o', {})
+                await self._handle_order_update(order_data)
+
+            elif event_type == 'ACCOUNT_UPDATE':
+                # 账户更新事件
+                account_data = data.get('a', {})
+                self._handle_account_update(account_data)
+
+            elif event_type == 'listenKeyExpired':
+                # Listen key过期事件
+                self.logger.warning("Listen key已过期，需要重新获取")
+
+        except Exception as e:
+            self.logger.error(f"处理用户数据消息失败: {e}")
+
+    async def _handle_order_update(self, order_data: Dict[str, Any]):
+        """处理订单更新事件"""
+        try:
+            if self.event_queue:
+                # 构建事件对象
+                event = {
+                    "event_type": "ORDER_UPDATE",
+                    "account_name": self.account_name,
+                    "data": order_data,
+                    "timestamp": time.time()
+                }
+
+                # 将事件放入队列
+                await self.event_queue.put(event)
+
+                # 记录日志
+                client_order_id = order_data.get('c', 'unknown')
+                status = order_data.get('X', 'unknown')
+                self.logger.debug(f"订单事件已推送: {client_order_id} -> {status}")
+
+        except Exception as e:
+            self.logger.error(f"处理订单更新事件失败: {e}")
+
+    def _handle_account_update(self, account_data: Dict[str, Any]):
+        """处理账户更新事件"""
+        try:
+            # 更新持仓信息
+            positions = account_data.get('P', [])
+            for pos in positions:
+                symbol = pos.get('s', '')
+                if symbol == self.trading_pair.replace('/', '').replace(':USDC', ''):
+                    position_amt = Decimal(str(pos.get('pa', '0')))
+                    if position_amt > 0:
+                        self.long_position = position_amt
+                        self.short_position = Decimal("0")
+                    elif position_amt < 0:
+                        self.short_position = abs(position_amt)
+                        self.long_position = Decimal("0")
+                    else:
+                        self.long_position = Decimal("0")
+                        self.short_position = Decimal("0")
+
+                    self.logger.debug(f"持仓更新: 多头={self.long_position}, 空头={self.short_position}")
+                    break
+
+        except Exception as e:
+            self.logger.error(f"处理账户更新事件失败: {e}")
