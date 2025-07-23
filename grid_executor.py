@@ -1,5 +1,6 @@
 # dual_grid_bot/grid_executor.py
 
+import asyncio
 import logging
 import math
 import time
@@ -742,6 +743,10 @@ class GridExecutor:
         except Exception as e:
             self.logger.error(f"平掉所有持仓时出错: {e}")
 
+
+
+
+
     async def start(self):
         """启动网格执行器"""
         try:
@@ -753,12 +758,27 @@ class GridExecutor:
             # 设置状态为运行中
             self._status = RunnableStatus.RUNNING
 
+            # 启动控制任务 - 使用完整版本的control_task
+            self.control_task_handle = asyncio.create_task(self._main_control_loop())
+
             self.logger.info("网格执行器启动成功")
 
         except Exception as e:
             self.logger.error(f"启动网格执行器时出错: {e}")
             self._status = RunnableStatus.TERMINATED
             raise
+
+    async def _main_control_loop(self):
+        """主控制循环 - 定期调用完整版本的control_task"""
+        try:
+            while self._status == RunnableStatus.RUNNING:
+                await self.control_task()
+                await asyncio.sleep(1)  # 每秒执行一次控制逻辑
+        except Exception as e:
+            self.logger.error(f"主控制循环异常: {e}")
+            self._status = RunnableStatus.TERMINATED
+
+
 
     async def stop(self):
         """停止网格执行器"""
@@ -767,6 +787,14 @@ class GridExecutor:
 
             # 设置状态为关闭中
             self._status = RunnableStatus.SHUTTING_DOWN
+
+            # 停止控制任务
+            if hasattr(self, 'control_task_handle') and self.control_task_handle:
+                self.control_task_handle.cancel()
+                try:
+                    await self.control_task_handle
+                except asyncio.CancelledError:
+                    pass
 
             # 取消所有订单
             await self.cancel_open_orders()

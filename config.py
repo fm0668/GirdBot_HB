@@ -39,7 +39,7 @@ LEVERAGE = 20  # 杠杆倍数
 GRID_CONFIG = {
     # 网格边界
     "start_price": Decimal("0.24800"),  # 网格起始价格
-    "end_price": Decimal("0.28000"),    # 网格结束价格
+    "end_price": Decimal("0.27800"),    # 网格结束价格
     "total_amount_quote": Decimal("1000"),  # 总投入资金(USDC) - 调整为适合当前余额
     
     # 网格行为
@@ -49,11 +49,11 @@ GRID_CONFIG = {
     
     # 执行细节
     "order_frequency": 0,  # 两次下单之间的最小秒数 (0=无限制，与Hummingbot一致)
-    "activation_bounds": None,  # 动态挂单的激活范围 (None=无限制，与Hummingbot一致)
+    "activation_bounds": Decimal("0.05"),  # 动态挂单的激活范围 (5%，启用智能跟随价格功能)
     "safe_extra_spread": Decimal("0.0001"),  # 防止吃单的安全价差
     
     # 止盈配置
-    "take_profit_pct": Decimal("0.001"),  # 每层网格的止盈百分比(0.1%)
+    "take_profit_pct": Decimal("0.002"),  # 每层网格的止盈百分比(0.2%)
 
     # 边界处理配置
     "boundary_stop_enabled": True,        # 是否启用边界停止功能
